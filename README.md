@@ -4,6 +4,12 @@
 
 Оно не запрашивает API-ключи, не передаёт данные в сеть и не требует специальных разрешений macOS. Информация читается локально из `~/.codex/sessions`; активной считается сессия без финального события `task_complete`, обновлявшаяся за последние 24 часа.
 
+## Установка без CLI
+
+В разделе [Releases](../../releases) скачай архив `CodexQuotaMenu-<версия>-macos.zip`, распакуй его и перетащи `CodexQuotaMenu.app` в `/Applications`. Swift, Homebrew и другие CLI-инструменты для этого не нужны.
+
+Первый публичный релиз подписан ad-hoc подписью. Если Gatekeeper заблокирует запуск, открой приложение через Finder с зажатой клавишей Control и выбери «Открыть». После подписи Developer ID и notarization этот шаг не понадобится.
+
 ## Запуск
 
 Требуется Xcode Command Line Tools (Swift 6):
@@ -47,12 +53,6 @@ CODE_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./Scripts/buil
 ```
 
 Затем notarize приложение у Apple перед публикацией релиза.
-
-## Установка без CLI
-
-В разделе [Releases](../../releases) скачай архив `CodexQuotaMenu-<версия>-macos.zip`, распакуй его и перетащи `CodexQuotaMenu.app` в `/Applications`. Swift, Homebrew и другие CLI-инструменты для этого не нужны.
-
-Первый публичный релиз подписан ad-hoc подписью. Если Gatekeeper заблокирует запуск, открой приложение через Finder с зажатой клавишей Control и выбери «Открыть». После подписи Developer ID и notarization этот шаг не понадобится.
 
 ## Ограничение
 
