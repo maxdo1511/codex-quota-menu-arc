@@ -419,12 +419,20 @@ private final class DailyUsageReporter {
         }
     }
 
-    /// ARC workspaces are recognised from the dedicated local root (`arc_*`).
-    /// This deliberately does not invoke Git or GitHub.
+    /// Arcadia mounts expose `.arcadia.root` at their true root. Walking upwards
+    /// from Codex's cwd correctly handles an arbitrary number of virtual mounts
+    /// and deliberately does not invoke Git or GitHub.
     private static func arcRepositoryName(for workingDirectory: String) -> String? {
-        URL(fileURLWithPath: workingDirectory).pathComponents.first {
-            $0.lowercased().hasPrefix("arc_")
+        let fileManager = FileManager.default
+        var candidate = URL(fileURLWithPath: workingDirectory, isDirectory: true).standardizedFileURL
+        while candidate.path != "/" {
+            let marker = candidate.appendingPathComponent(".arcadia.root", isDirectory: false)
+            if fileManager.fileExists(atPath: marker.path) {
+                return candidate.lastPathComponent
+            }
+            candidate.deleteLastPathComponent()
         }
+        return nil
     }
 
     private static func isMeaningfulAddedCodeLine(_ diffLine: Substring) -> Bool {
