@@ -94,8 +94,35 @@ private struct RateSample: Codable {
 }
 
 private final class CodexStateReader {
+    private struct SessionFile {
+        let url: URL
+        var modificationDate: Date
+    }
+
+    private struct RateLimitEvent {
+        let windows: [RateWindow]
+        let updatedAt: Date
+    }
+
+    private struct MCPEvent {
+        let timestamp: Date
+        let name: String
+    }
+
+    private struct FileMetrics {
+        let modificationDate: Date
+        let lastPayloadType: String?
+        let taskCount: Int
+        let latestRateLimits: RateLimitEvent?
+        let mcpEvents: [MCPEvent]
+    }
+
     private let fileManager = FileManager.default
     private let codexDirectory: URL
+    private var cachedSessionFiles: [SessionFile] = []
+    private var fileMetrics: [URL: FileMetrics] = [:]
+    private var lastDirectoryScan = Date.distantPast
+    private let directoryScanInterval: TimeInterval = 10
 
     init(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) {
         codexDirectory = homeDirectory.appendingPathComponent(".codex", isDirectory: true)
@@ -103,29 +130,30 @@ private final class CodexStateReader {
 
     func load() -> UsageSnapshot {
         let files = sessionFiles()
-        let latest = latestRateLimits()
+        let latest = latestRateLimits(from: files)
         let sessions = recentSessions(from: files)
         return UsageSnapshot(
             windows: latest?.windows ?? [],
             updatedAt: latest?.updatedAt ?? .now,
             activeSessions: activeSessionCount(from: files),
             sessions: sessions,
-            recentMCPs: recentMCPs()
+            recentMCPs: recentMCPs(from: files)
         )
     }
 
-    private func activeSessionCount(from files: [(url: URL, modificationDate: Date)]) -> Int {
+    private func activeSessionCount(from files: [SessionFile]) -> Int {
         let cutoff = Date.now.addingTimeInterval(-86_400)
         return files.reduce(into: 0) { count, file in
-            guard file.modificationDate >= cutoff, lastPayloadType(in: file.url) != "task_complete" else { return }
+            guard file.modificationDate >= cutoff, metrics(for: file).lastPayloadType != "task_complete" else { return }
             count += 1
         }
     }
 
-    private func recentSessions(from files: [(url: URL, modificationDate: Date)]) -> [SessionBrief] {
+    private func recentSessions(from files: [SessionFile]) -> [SessionBrief] {
         let workingCutoff = Date.now.addingTimeInterval(-120)
         return files.prefix(5).map { file in
-            let lastType = lastPayloadType(in: file.url)
+            let metrics = metrics(for: file)
+            let lastType = metrics.lastPayloadType
             let state: SessionState
             if lastType == "task_complete" {
                 state = .completed
@@ -138,106 +166,140 @@ private final class CodexStateReader {
                 id: threadID(from: file.url) ?? file.url.deletingPathExtension().lastPathComponent,
                 state: state,
                 lastActivity: file.modificationDate,
-                taskCount: taskCount(in: file.url)
+                taskCount: metrics.taskCount
             )
         }
     }
 
-    private func latestRateLimits() -> (windows: [RateWindow], updatedAt: Date)? {
-        for file in sessionFiles().prefix(30) {
-            if let limits = latestRateLimits(in: file.url) { return limits }
+    private func latestRateLimits(from files: [SessionFile]) -> RateLimitEvent? {
+        for file in files.prefix(30) {
+            if let limits = metrics(for: file).latestRateLimits { return limits }
         }
         return nil
     }
 
-    private func sessionFiles() -> [(url: URL, modificationDate: Date)] {
+    private func sessionFiles() -> [SessionFile] {
+        if Date.now.timeIntervalSince(lastDirectoryScan) >= directoryScanInterval {
+            cachedSessionFiles = scanRecentSessionDirectories()
+            let liveFiles = Set(cachedSessionFiles.map(\.url))
+            fileMetrics = fileMetrics.filter { liveFiles.contains($0.key) }
+            lastDirectoryScan = .now
+        } else {
+            refreshKnownFileDates()
+        }
+        return cachedSessionFiles
+    }
+
+    /// Codex keeps sessions in day folders. Looking at the last week avoids an
+    /// expensive recursive walk through the entire archive on every refresh.
+    private func scanRecentSessionDirectories() -> [SessionFile] {
+        let calendar = Calendar.current
         let sessionsURL = codexDirectory.appendingPathComponent("sessions", isDirectory: true)
-        guard let enumerator = fileManager.enumerator(
-            at: sessionsURL,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-
-        return enumerator.compactMap { item in
-            guard let url = item as? URL,
-                  url.pathExtension == "jsonl",
-                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
-                  values.isRegularFile == true,
-                  let modificationDate = values.contentModificationDate
-            else { return nil }
-            return (url, modificationDate)
-        }
-        .sorted { $0.modificationDate > $1.modificationDate }
-    }
-
-    private func lastPayloadType(in file: URL) -> String? {
-        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
-            guard let data = line.data(using: .utf8),
-                  let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let payload = event["payload"] as? [String: Any],
-                  let type = payload["type"] as? String
-            else { continue }
-            return type
-        }
-        return nil
-    }
-
-    private func taskCount(in file: URL) -> Int {
-        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return 0 }
-        return text.split(separator: "\n", omittingEmptySubsequences: true).reduce(into: 0) { count, line in
-            guard let data = line.data(using: .utf8),
-                  let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let payload = event["payload"] as? [String: Any],
-                  payload["type"] as? String == "task_complete"
-            else { return }
-            count += 1
-        }
-    }
-
-    private func latestRateLimits(in file: URL) -> (windows: [RateWindow], updatedAt: Date)? {
-        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
-            guard let data = line.data(using: .utf8),
-                  let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let payload = event["payload"] as? [String: Any],
-                  let limits = payload["rate_limits"] as? [String: Any]
-            else { continue }
-
-            let windows = ["primary", "secondary"].compactMap { key -> RateWindow? in
-                guard let value = limits[key] as? [String: Any],
-                      let usedPercent = value["used_percent"] as? Double,
-                      let minutes = value["window_minutes"] as? Int
+        var files: [SessionFile] = []
+        for offset in 0..<7 {
+            guard let day = calendar.date(byAdding: .day, value: -offset, to: .now) else { continue }
+            let components = calendar.dateComponents([.year, .month, .day], from: day)
+            guard let year = components.year, let month = components.month, let day = components.day else { continue }
+            let directory = sessionsURL
+                .appendingPathComponent(String(year), isDirectory: true)
+                .appendingPathComponent(String(format: "%02d", month), isDirectory: true)
+                .appendingPathComponent(String(format: "%02d", day), isDirectory: true)
+            guard let urls = try? fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+            files += urls.compactMap { url in
+                guard url.pathExtension == "jsonl",
+                      let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
+                      values.isRegularFile == true,
+                      let modificationDate = values.contentModificationDate
                 else { return nil }
-                let resetTimestamp = (value["resets_at"] as? NSNumber)?.doubleValue
-                return RateWindow(
-                    usedPercent: usedPercent,
-                    windowMinutes: minutes,
-                    resetsAt: resetTimestamp.map(Date.init(timeIntervalSince1970:))
-                )
+                return SessionFile(url: url, modificationDate: modificationDate)
             }
-            guard !windows.isEmpty else { continue }
-            let updatedAt = (event["timestamp"] as? String).flatMap(Self.isoDate) ?? .now
-            return (windows, updatedAt)
         }
-        return nil
+        return files.sorted { $0.modificationDate > $1.modificationDate }
     }
 
-    private func recentMCPs() -> [String] {
-        let cutoff = Date.now.addingTimeInterval(-300)
-        var names = Set<String>()
-        for file in sessionFiles().prefix(30) where file.modificationDate >= cutoff {
-            guard let text = try? String(contentsOf: file.url, encoding: .utf8) else { continue }
-            for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
+    /// A one-second refresh only stats recently active files; their content is
+    /// parsed again solely after their modification date changes.
+    private func refreshKnownFileDates() {
+        var refreshed = cachedSessionFiles
+        for index in refreshed.indices.prefix(30) {
+            let url = refreshed[index].url
+            guard let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                  date != refreshed[index].modificationDate
+            else { continue }
+            refreshed[index].modificationDate = date
+            fileMetrics.removeValue(forKey: url)
+        }
+        cachedSessionFiles = refreshed.sorted { $0.modificationDate > $1.modificationDate }
+    }
+
+    private func metrics(for file: SessionFile) -> FileMetrics {
+        if let cached = fileMetrics[file.url], cached.modificationDate == file.modificationDate {
+            return cached
+        }
+
+        var lastPayloadType: String?
+        var taskCount = 0
+        var latestRateLimits: RateLimitEvent?
+        var mcpEvents: [MCPEvent] = []
+        if let text = try? String(contentsOf: file.url, encoding: .utf8) {
+            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
                 guard let data = line.data(using: .utf8),
                       let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let timestamp = (event["timestamp"] as? String).flatMap(Self.isoDate), timestamp >= cutoff,
-                      let payload = event["payload"] as? [String: Any], payload["type"] as? String == "mcp_tool_call_end",
-                      let invocation = payload["invocation"] as? [String: Any],
-                      let server = invocation["server"] as? String, let tool = invocation["tool"] as? String
+                      let payload = event["payload"] as? [String: Any]
                 else { continue }
-                names.insert("\(server)/\(tool)")
+                let timestamp = (event["timestamp"] as? String).flatMap(Self.isoDate)
+                if let type = payload["type"] as? String {
+                    lastPayloadType = type
+                    if type == "task_complete" { taskCount += 1 }
+                    if type == "mcp_tool_call_end",
+                       let timestamp,
+                       let invocation = payload["invocation"] as? [String: Any],
+                       let server = invocation["server"] as? String,
+                       let tool = invocation["tool"] as? String {
+                        mcpEvents.append(MCPEvent(timestamp: timestamp, name: "\(server)/\(tool)"))
+                        if mcpEvents.count > 100 { mcpEvents.removeFirst(mcpEvents.count - 100) }
+                    }
+                }
+                guard let limits = payload["rate_limits"] as? [String: Any] else { continue }
+                let windows = ["primary", "secondary"].compactMap { key -> RateWindow? in
+                    guard let value = limits[key] as? [String: Any],
+                          let usedPercent = value["used_percent"] as? Double,
+                          let minutes = value["window_minutes"] as? Int
+                    else { return nil }
+                    let resetTimestamp = (value["resets_at"] as? NSNumber)?.doubleValue
+                    return RateWindow(
+                        usedPercent: usedPercent,
+                        windowMinutes: minutes,
+                        resetsAt: resetTimestamp.map(Date.init(timeIntervalSince1970:))
+                    )
+                }
+                if !windows.isEmpty {
+                    latestRateLimits = RateLimitEvent(windows: windows, updatedAt: timestamp ?? .now)
+                }
             }
+        }
+        let metrics = FileMetrics(
+            modificationDate: file.modificationDate,
+            lastPayloadType: lastPayloadType,
+            taskCount: taskCount,
+            latestRateLimits: latestRateLimits,
+            mcpEvents: mcpEvents
+        )
+        fileMetrics[file.url] = metrics
+        return metrics
+    }
+
+    private func recentMCPs(from files: [SessionFile]) -> [String] {
+        let cutoff = Date.now.addingTimeInterval(-300)
+        var names = Set<String>()
+        for file in files.prefix(30) where file.modificationDate >= cutoff {
+            metrics(for: file).mcpEvents
+                .filter { $0.timestamp >= cutoff }
+                .forEach { names.insert($0.name) }
         }
         return names.sorted()
     }
@@ -919,6 +981,7 @@ private final class MenuBarController: NSObject {
     private var refreshTimer: Timer?
     private var dailyReport: DailyUsageReport?
     private var lastReportUpdate = Date.distantPast
+    private var lastRateHistoryUpdate = Date.distantPast
     private var settingsWindow: SettingsWindowController?
     private var historyWindow: HistoryWindowController?
     private var rateSamples: [RateSample] = []
@@ -943,11 +1006,19 @@ private final class MenuBarController: NSObject {
     }
 
     @objc private func refresh() {
+        let previousSnapshot = snapshot
         snapshot = reader.load()
-        if let snapshot { rateSamples = rateHistory.record(snapshot) }
-        refreshDailyReportIfNeeded()
-        updateStatusTitle()
-        statusItem.menu = makeMenu()
+        var shouldRebuildMenu = snapshot != previousSnapshot
+        if let snapshot, Date.now.timeIntervalSince(lastRateHistoryUpdate) >= 60 {
+            rateSamples = rateHistory.record(snapshot)
+            lastRateHistoryUpdate = .now
+            shouldRebuildMenu = true
+        }
+        shouldRebuildMenu = refreshDailyReportIfNeeded() || shouldRebuildMenu
+        if shouldRebuildMenu {
+            updateStatusTitle()
+            statusItem.menu = makeMenu()
+        }
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
@@ -1081,16 +1152,19 @@ private final class MenuBarController: NSObject {
         return menu
     }
 
-    private func refreshDailyReportIfNeeded() {
+    @discardableResult
+    private func refreshDailyReportIfNeeded() -> Bool {
         guard settings.exportDailyReports else {
+            let changed = dailyReport != nil
             dailyReport = nil
-            return
+            return changed
         }
-        guard Date.now.timeIntervalSince(lastReportUpdate) >= 60 else { return }
+        guard Date.now.timeIntervalSince(lastReportUpdate) >= 60 else { return false }
         let report = reporter.currentDayReport()
         dailyReport = report
         lastReportUpdate = .now
         _ = try? reporter.write(report)
+        return true
     }
 
     private func shortMCPList(_ names: [String]) -> String {
