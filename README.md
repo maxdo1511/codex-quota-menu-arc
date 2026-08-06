@@ -6,21 +6,19 @@
 
 ## Как выглядит
 
-<!--
-Положите скриншоты в `docs/screenshots/`, затем раскомментируйте блок ниже.
-
 <p align="center">
-  <img src="docs/screenshots/menu.png" alt="Меню Codex Quota" width="480">
+  <img width="96" height="24" alt="Screenshot 2026-08-06 at 18 21 13" src="https://github.com/user-attachments/assets/32ec30d8-bd83-44b1-a50b-c4e61ced59d9" /> <img width="78" height="24" alt="Screenshot 2026-08-06 at 18 22 11" src="https://github.com/user-attachments/assets/8100c57b-548f-4d9f-a069-d491d65182e2" />
+
   <br>
   <em>Квота, сессии и статистика в строке меню.</em>
 </p>
 
+
 <p align="center">
-  <img src="docs/screenshots/history.png" alt="История Codex Quota" width="720">
+  <img width="497" height="96" alt="Screenshot 2026-08-06 at 18 29 47" src="https://github.com/user-attachments/assets/e33f2800-3070-4436-8b48-7144684ac217" />
   <br>
-  <em>История расхода квоты и работы по дням.</em>
+  <em>Краткая сводка.</em>
 </p>
--->
 
 ## Установка
 
