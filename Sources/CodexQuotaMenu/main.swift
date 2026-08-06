@@ -28,6 +28,37 @@ private struct UsageSnapshot: Equatable {
     let activeSessions: Int
     let sessions: [SessionBrief]
     let recentMCPs: [String]
+    let osy: OSYUsage?
+}
+
+/// Aggregate-only OSY metrics. No prompt or response text is read or stored.
+private struct OSYUsage: Codable, Equatable {
+    let requests: Int
+    let conversations: Int
+    let inputTokens: Int
+    let outputTokens: Int
+    let cacheReadInputTokens: Int
+    let cacheCreationInputTokens: Int
+    let totalCostUSD: Double
+    let neuralWorkSeconds: Int
+    let activeChats: Int
+    let models: [String]
+
+    static func sum(_ values: [OSYUsage]) -> OSYUsage? {
+        guard !values.isEmpty else { return nil }
+        return OSYUsage(
+            requests: values.reduce(0) { $0 + $1.requests },
+            conversations: values.reduce(0) { $0 + $1.conversations },
+            inputTokens: values.reduce(0) { $0 + $1.inputTokens },
+            outputTokens: values.reduce(0) { $0 + $1.outputTokens },
+            cacheReadInputTokens: values.reduce(0) { $0 + $1.cacheReadInputTokens },
+            cacheCreationInputTokens: values.reduce(0) { $0 + $1.cacheCreationInputTokens },
+            totalCostUSD: values.reduce(0) { $0 + $1.totalCostUSD },
+            neuralWorkSeconds: values.reduce(0) { $0 + $1.neuralWorkSeconds },
+            activeChats: values.reduce(0) { $0 + $1.activeChats },
+            models: Array(Set(values.flatMap(\.models))).sorted()
+        )
+    }
 }
 
 private enum SessionState: String {
@@ -79,6 +110,7 @@ private struct UsageTotals: Codable {
     let codeLinesRemoved: Int
     let arcRepositories: Int?
     let arcMeaningfulCodeLinesAdded: Int?
+    let osy: OSYUsage?
 }
 
 private struct DailyUsageReport: Codable {
@@ -98,6 +130,25 @@ private struct MonthlyUsageArchive: Codable {
 private struct RateSample: Codable {
     let recordedAt: Date
     let remainingByWindow: [Int: Int]
+}
+
+/// MCP calls may be nested in a custom `exec` tool request. Codex records that
+/// outer request as `custom_tool_call`, without a separate `mcp_tool_call_end`.
+/// Recognize only real `tools.mcp__…` invocations, not arbitrary text in a prompt.
+private enum NestedMCPToolCallReader {
+    private static let expression = try! NSRegularExpression(
+        pattern: #"tools\.mcp__([A-Za-z0-9_]+)__([A-Za-z0-9_]+)"#
+    )
+
+    static func names(in source: String) -> [String] {
+        let range = NSRange(source.startIndex..., in: source)
+        return expression.matches(in: source, range: range).compactMap { match in
+            guard let serverRange = Range(match.range(at: 1), in: source),
+                  let toolRange = Range(match.range(at: 2), in: source)
+            else { return nil }
+            return "\(source[serverRange])/\(source[toolRange])"
+        }
+    }
 }
 
 private final class CodexStateReader {
@@ -135,7 +186,7 @@ private final class CodexStateReader {
         codexDirectory = homeDirectory.appendingPathComponent(".codex", isDirectory: true)
     }
 
-    func load() -> UsageSnapshot {
+    func load(osy: OSYUsage?) -> UsageSnapshot {
         let files = sessionFiles()
         let latest = latestRateLimits(from: files)
         let sessions = recentSessions(from: files)
@@ -144,7 +195,8 @@ private final class CodexStateReader {
             updatedAt: latest?.updatedAt ?? .now,
             activeSessions: activeSessionCount(from: files),
             sessions: sessions,
-            recentMCPs: recentMCPs(from: files)
+            recentMCPs: recentMCPs(from: files),
+            osy: osy
         )
     }
 
@@ -270,6 +322,14 @@ private final class CodexStateReader {
                         mcpEvents.append(MCPEvent(timestamp: timestamp, name: "\(server)/\(tool)"))
                         if mcpEvents.count > 100 { mcpEvents.removeFirst(mcpEvents.count - 100) }
                     }
+                    if (type == "function_call" || type == "custom_tool_call"),
+                       let timestamp,
+                       let input = payload["input"] as? String {
+                        for name in NestedMCPToolCallReader.names(in: input) {
+                            mcpEvents.append(MCPEvent(timestamp: timestamp, name: name))
+                        }
+                        if mcpEvents.count > 100 { mcpEvents.removeFirst(mcpEvents.count - 100) }
+                    }
                 }
                 guard let limits = payload["rate_limits"] as? [String: Any] else { continue }
                 let windows = ["primary", "secondary"].compactMap { key -> RateWindow? in
@@ -312,7 +372,9 @@ private final class CodexStateReader {
     }
 
     private static func isoDate(_ value: String) -> Date? {
-        ISO8601DateFormatter().date(from: value)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: value)
     }
 
     private func threadID(from url: URL) -> String? {
@@ -320,6 +382,120 @@ private final class CodexStateReader {
         let name = url.deletingPathExtension().lastPathComponent
         guard let range = name.range(of: pattern, options: .regularExpression) else { return nil }
         return String(name[range])
+    }
+}
+
+private final class OSYStateReader {
+    private struct ChatLogEntry: Decodable {
+        let ts: String
+        let chat_id: String
+        let line: String
+    }
+
+    private struct ChatEvent: Decodable {
+        let type: String
+        let duration_ms: Int?
+    }
+
+    private let fileManager = FileManager.default
+    private let usageURL: URL
+    private let eventsURL: URL
+    private var cachedUsageDate: Date?
+    private var cachedEventsDate: Date?
+    private var cachedDay = ""
+    private var cachedUsage: OSYUsage?
+    private var latestEventsByChat: [String: (date: Date, type: String)] = [:]
+    private var neuralWorkSeconds = 0
+
+    init(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        let osyDirectory = homeDirectory.appendingPathComponent(".osy", isDirectory: true)
+        usageURL = osyDirectory.appendingPathComponent("usage.json")
+        eventsURL = osyDirectory.appendingPathComponent("logs/chat-events.jsonl")
+    }
+
+    func load() -> OSYUsage? {
+        let day = Self.dayString(for: .now)
+        let usageDate = modificationDate(of: usageURL)
+        let eventsDate = modificationDate(of: eventsURL)
+        if day != cachedDay || usageDate != cachedUsageDate {
+            cachedUsage = loadUsage(for: day)
+            cachedUsageDate = usageDate
+            cachedDay = day
+        }
+        guard var usage = cachedUsage else { return nil }
+        if day != cachedDay || eventsDate != cachedEventsDate {
+            loadEvents(for: day)
+            cachedEventsDate = eventsDate
+        }
+        let cutoff = Date.now.addingTimeInterval(-120)
+        usage = OSYUsage(
+            requests: usage.requests,
+            conversations: usage.conversations,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            cacheReadInputTokens: usage.cacheReadInputTokens,
+            cacheCreationInputTokens: usage.cacheCreationInputTokens,
+            totalCostUSD: usage.totalCostUSD,
+            neuralWorkSeconds: neuralWorkSeconds,
+            activeChats: latestEventsByChat.values.filter { $0.date >= cutoff && $0.type != "result" }.count,
+            models: usage.models
+        )
+        return usage
+    }
+
+    private func loadUsage(for day: String) -> OSYUsage? {
+        guard let data = try? Data(contentsOf: usageURL),
+              let usageByDay = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let usage = usageByDay[day] as? [String: Any]
+        else { return nil }
+        return OSYUsage(
+            requests: Self.integer(usage["requests"]),
+            conversations: (usage["conversations"] as? [String: Any])?.count ?? 0,
+            inputTokens: Self.integer(usage["input_tokens"]),
+            outputTokens: Self.integer(usage["output_tokens"]),
+            cacheReadInputTokens: Self.integer(usage["cache_read_input_tokens"]),
+            cacheCreationInputTokens: Self.integer(usage["cache_creation_input_tokens"]),
+            totalCostUSD: (usage["total_cost_usd"] as? NSNumber)?.doubleValue ?? 0,
+            neuralWorkSeconds: 0,
+            activeChats: 0,
+            models: (usage["models"] as? [String: Any]).map { Array($0.keys).sorted() } ?? []
+        )
+    }
+
+    private func loadEvents(for day: String) {
+        latestEventsByChat = [:]
+        neuralWorkSeconds = 0
+        guard let text = try? String(contentsOf: eventsURL, encoding: .utf8) else { return }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let data = line.data(using: .utf8),
+                  let entry = try? JSONDecoder().decode(ChatLogEntry.self, from: data),
+                  let date = formatter.date(from: entry.ts),
+                  Self.dayString(for: date) == day,
+                  let eventData = entry.line.data(using: .utf8),
+                  let event = try? JSONDecoder().decode(ChatEvent.self, from: eventData)
+            else { continue }
+            latestEventsByChat[entry.chat_id] = (date, event.type)
+            if event.type == "result" {
+                neuralWorkSeconds += max(0, (event.duration_ms ?? 0) / 1_000)
+            }
+        }
+    }
+
+    private func modificationDate(of url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+
+    private static func integer(_ value: Any?) -> Int {
+        (value as? NSNumber)?.intValue ?? 0
+    }
+
+    private static func dayString(for date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
     }
 }
 
@@ -416,7 +592,7 @@ private final class DailyUsageReporter {
         return archivedMonths
     }
 
-    func currentDayReport() -> DailyUsageReport {
+    func currentDayReport(osyUsage: OSYUsage?) -> DailyUsageReport {
         let sessions = todaySessionFiles().compactMap(sessionUsage(in:)).sorted { $0.id < $1.id }
         let totals = UsageTotals(
             sessions: sessions.count,
@@ -428,7 +604,8 @@ private final class DailyUsageReporter {
             codeLinesAdded: sessions.reduce(0) { $0 + $1.codeLinesAdded },
             codeLinesRemoved: sessions.reduce(0) { $0 + $1.codeLinesRemoved },
             arcRepositories: Set(sessions.compactMap(\.arcRepository)).count,
-            arcMeaningfulCodeLinesAdded: sessions.reduce(0) { $0 + ($1.arcMeaningfulCodeLinesAdded ?? 0) }
+            arcMeaningfulCodeLinesAdded: sessions.reduce(0) { $0 + ($1.arcMeaningfulCodeLinesAdded ?? 0) },
+            osy: osyUsage
         )
         return DailyUsageReport(day: Self.dayString(for: .now), generatedAt: .now, totals: totals, sessions: sessions)
     }
@@ -469,7 +646,8 @@ private final class DailyUsageReporter {
             codeLinesAdded: reports.reduce(0) { $0 + $1.totals.codeLinesAdded },
             codeLinesRemoved: reports.reduce(0) { $0 + $1.totals.codeLinesRemoved },
             arcRepositories: Set(allSessions.compactMap(\.arcRepository)).count,
-            arcMeaningfulCodeLinesAdded: reports.reduce(0) { $0 + ($1.totals.arcMeaningfulCodeLinesAdded ?? 0) }
+            arcMeaningfulCodeLinesAdded: reports.reduce(0) { $0 + ($1.totals.arcMeaningfulCodeLinesAdded ?? 0) },
+            osy: OSYUsage.sum(reports.compactMap(\.totals.osy))
         )
     }
 
@@ -499,16 +677,28 @@ private final class DailyUsageReporter {
     }
 
     private func todaySessionFiles() -> [URL] {
-        let components = Calendar.current.dateComponents([.year, .month, .day], from: .now)
-        guard let year = components.year, let month = components.month, let day = components.day else { return [] }
-        let directory = codexDirectory
-            .appendingPathComponent("sessions/\(year)", isDirectory: true)
-            .appendingPathComponent(String(format: "%02d", month), isDirectory: true)
-            .appendingPathComponent(String(format: "%02d", day), isDirectory: true)
-        guard let files = try? fileManager.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]
-        ) else { return [] }
-        return files.filter { $0.pathExtension == "jsonl" }
+        let calendar = Calendar.current
+        let startOfToday = calendar.startOfDay(for: .now)
+        let directories = (0..<7).compactMap { offset -> URL? in
+            guard let date = calendar.date(byAdding: .day, value: -offset, to: startOfToday) else { return nil }
+            let components = calendar.dateComponents([.year, .month, .day], from: date)
+            guard let year = components.year, let month = components.month, let day = components.day else { return nil }
+            return codexDirectory
+                .appendingPathComponent("sessions/\(year)", isDirectory: true)
+                .appendingPathComponent(String(format: "%02d", month), isDirectory: true)
+                .appendingPathComponent(String(format: "%02d", day), isDirectory: true)
+        }
+
+        return directories.flatMap { directory in
+            (try? fileManager.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
+            )) ?? []
+        }.filter { file in
+            guard file.pathExtension == "jsonl",
+                  let modifiedAt = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            else { return false }
+            return modifiedAt >= startOfToday
+        }
     }
 
     private func sessionUsage(in file: URL) -> SessionUsage? {
@@ -526,6 +716,8 @@ private final class DailyUsageReporter {
         var mcpByName: [String: Int] = [:]
         var arcRepository: String?
         var arcMeaningfulCodeLinesAdded = 0
+        var hasTodayActivity = false
+        let startOfToday = Calendar.current.startOfDay(for: .now)
 
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             guard let data = line.data(using: .utf8),
@@ -537,6 +729,8 @@ private final class DailyUsageReporter {
             }
             guard let type = payload["type"] as? String else { continue }
             let timestamp = (event["timestamp"] as? String).flatMap(Self.isoDate)
+            guard let timestamp, timestamp >= startOfToday else { continue }
+            hasTodayActivity = true
             switch type {
             case "task_started":
                 startedAt = startedAt ?? timestamp
@@ -548,8 +742,14 @@ private final class DailyUsageReporter {
                 openTaskStartedAt = nil
             case "function_call", "custom_tool_call":
                 toolCalls += 1
-                if let input = payload["input"] as? String, input.contains(".codex/skills/"), input.contains("SKILL.md") {
-                    skillReads += 1
+                if let input = payload["input"] as? String {
+                    if input.contains(".codex/skills/"), input.contains("SKILL.md") {
+                        skillReads += 1
+                    }
+                    for name in NestedMCPToolCallReader.names(in: input) {
+                        mcpCalls += 1
+                        mcpByName[name, default: 0] += 1
+                    }
                 }
             case "mcp_tool_call_end":
                 mcpCalls += 1
@@ -573,6 +773,7 @@ private final class DailyUsageReporter {
             }
         }
 
+        guard hasTodayActivity else { return nil }
         if let openTaskStartedAt { neuralWorkSeconds += max(0, Int(Date.now.timeIntervalSince(openTaskStartedAt))) }
         return SessionUsage(
             id: id, startedAt: startedAt, completedAt: completedAt, taskCount: taskCount,
@@ -640,7 +841,11 @@ private final class DailyUsageReporter {
         return String(name[range])
     }
 
-    private static func isoDate(_ value: String) -> Date? { ISO8601DateFormatter().date(from: value) }
+    private static func isoDate(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: value)
+    }
 
     private static func dayString(for date: Date) -> String {
         let formatter = DateFormatter()
@@ -1014,9 +1219,14 @@ private final class HistoryWindowController: NSWindowController {
         } else {
             comparisonLabel.stringValue = "Сравнение появится после первого сохранённого дня"
         }
+        if let osy = totals.osy {
+            let cost = String(format: "%.2f", osy.totalCostUSD)
+            comparisonLabel.stringValue += " · OSY: \(Self.duration(osy.neuralWorkSeconds)), \(osy.requests) запросов, $\(cost)"
+        }
 
         daysLabel.stringValue = reports.suffix(4).map {
-            "\($0.day)    \(Self.duration($0.totals.neuralWorkSeconds))    задач \($0.totals.tasks)    ARC +\($0.totals.arcMeaningfulCodeLinesAdded ?? 0)"
+            let osy = $0.totals.osy.map { "    OSY \($0.requests) запросов" } ?? ""
+            return "\($0.day)    \(Self.duration($0.totals.neuralWorkSeconds))    задач \($0.totals.tasks)    ARC +\($0.totals.arcMeaningfulCodeLinesAdded ?? 0)\(osy)"
         }.joined(separator: "\n")
     }
 
@@ -1026,9 +1236,9 @@ private final class HistoryWindowController: NSWindowController {
         content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         window?.contentView = content
 
-        let title = NSTextField(labelWithString: "Статистика Codex")
+        let title = NSTextField(labelWithString: "Статистика Codex и OSY")
         title.font = .systemFont(ofSize: 24, weight: .bold)
-        let subtitle = NSTextField(labelWithString: "Работа, лимиты и вклад Codex в Arcadia")
+        let subtitle = NSTextField(labelWithString: "Работа, лимиты, использование OSY и вклад Codex в Arcadia")
         subtitle.font = .systemFont(ofSize: 13)
         subtitle.textColor = .secondaryLabelColor
         comparisonLabel.font = .systemFont(ofSize: 12, weight: .medium)
@@ -1105,6 +1315,7 @@ private final class HistoryWindowController: NSWindowController {
 @MainActor
 private final class MenuBarController: NSObject {
     private let reader = CodexStateReader()
+    private let osyReader = OSYStateReader()
     private let reporter = DailyUsageReporter()
     private let rateHistory = RateHistoryStore()
     private let settings = AppSettings()
@@ -1140,7 +1351,7 @@ private final class MenuBarController: NSObject {
 
     @objc private func refresh() {
         let previousSnapshot = snapshot
-        snapshot = reader.load()
+        snapshot = reader.load(osy: osyReader.load())
         var shouldRebuildMenu = snapshot != previousSnapshot
         if let snapshot, Date.now.timeIntervalSince(lastRateHistoryUpdate) >= 60 {
             rateSamples = rateHistory.record(snapshot)
@@ -1192,9 +1403,11 @@ private final class MenuBarController: NSObject {
         }
         let limits = snapshot.windows.map { "\($0.remainingPercent)%" }.joined(separator: " · ")
         let activity = snapshot.sessions.filter { $0.state == .working }.count
+        let osyActiveChats = snapshot.osy?.activeChats ?? 0
+        let combinedSessions = snapshot.activeSessions + osyActiveChats
         let mcp = settings.showRecentMCPs && !snapshot.recentMCPs.isEmpty ? "  MCP: \(shortMCPList(snapshot.recentMCPs))" : ""
-        statusItem.button?.title = "● \(snapshot.activeSessions)  \(limits)\(mcp)"
-        statusItem.button?.toolTip = "Codex: \(snapshot.activeSessions) активных сессий, из них \(activity) с новыми событиями; осталось: \(limits)\(mcp)"
+        statusItem.button?.title = "● \(combinedSessions)  \(limits)\(mcp)"
+        statusItem.button?.toolTip = "Активные сессии: \(combinedSessions) · Codex: \(snapshot.activeSessions), OSY: \(osyActiveChats) · Codex с новыми событиями: \(activity); осталось: \(limits)\(mcp)"
     }
 
     private func makeMenu() -> NSMenu {
@@ -1206,11 +1419,25 @@ private final class MenuBarController: NSObject {
             if let dailyReport {
                 let totals = dailyReport.totals
                 let report = NSMenuItem(
-                    title: "Сегодня: \(formatDuration(totals.neuralWorkSeconds)) · MCP \(totals.mcpCalls) · Tools \(totals.toolCalls) · Skills \(totals.skillReads) · Код +\(totals.codeLinesAdded)",
+                    title: "Codex сегодня: \(formatDuration(totals.neuralWorkSeconds)) · MCP \(totals.mcpCalls) · Tools \(totals.toolCalls) · Skills \(totals.skillReads) · Код +\(totals.codeLinesAdded)",
                     action: nil, keyEquivalent: ""
                 )
                 report.isEnabled = false
                 menu.addItem(report)
+                if let osy = totals.osy {
+                    let osyReport = NSMenuItem(
+                        title: "OSY сегодня: \(formatDuration(osy.neuralWorkSeconds)) · запросов \(osy.requests) · чатов \(osy.conversations) · токенов \(formatTokens(osy.inputTokens + osy.outputTokens)) · $\(formatUSD(osy.totalCostUSD))",
+                        action: nil,
+                        keyEquivalent: ""
+                    )
+                    osyReport.isEnabled = false
+                    menu.addItem(osyReport)
+                    if !osy.models.isEmpty {
+                        let models = NSMenuItem(title: "  OSY модели: \(osy.models.joined(separator: ", "))", action: nil, keyEquivalent: "")
+                        models.isEnabled = false
+                        menu.addItem(models)
+                    }
+                }
             }
 
             for window in snapshot.windows {
@@ -1239,7 +1466,8 @@ private final class MenuBarController: NSObject {
             }
 
             menu.addItem(.separator())
-            let sessions = NSMenuItem(title: "Активных сессий: \(snapshot.activeSessions) · с новыми событиями: \(working) · без новых событий: \(paused)", action: nil, keyEquivalent: "")
+            let osyActiveChats = snapshot.osy?.activeChats ?? 0
+            let sessions = NSMenuItem(title: "Активных сессий: \(snapshot.activeSessions + osyActiveChats) · Codex \(snapshot.activeSessions) · OSY \(osyActiveChats) · Codex с новыми событиями: \(working) · без новых событий: \(paused)", action: nil, keyEquivalent: "")
             sessions.isEnabled = false
             menu.addItem(sessions)
             for session in snapshot.sessions {
@@ -1294,7 +1522,7 @@ private final class MenuBarController: NSObject {
             return changed
         }
         guard Date.now.timeIntervalSince(lastReportUpdate) >= 60 else { return false }
-        let report = reporter.currentDayReport()
+        let report = reporter.currentDayReport(osyUsage: snapshot?.osy)
         dailyReport = report
         lastReportUpdate = .now
         if (try? reporter.write(report)) != nil, lastArchiveRunDay != report.day {
@@ -1313,6 +1541,14 @@ private final class MenuBarController: NSObject {
         let hours = seconds / 3_600
         let minutes = (seconds % 3_600) / 60
         return hours > 0 ? "\(hours)ч \(minutes)м" : "\(minutes)м"
+    }
+
+    private func formatTokens(_ value: Int) -> String {
+        value >= 1_000_000 ? String(format: "%.1fM", Double(value) / 1_000_000) : value >= 1_000 ? String(format: "%.1fK", Double(value) / 1_000) : "\(value)"
+    }
+
+    private func formatUSD(_ value: Double) -> String {
+        String(format: value >= 10 ? "%.0f" : "%.2f", value)
     }
 
     private func arcRepositorySummary(for report: DailyUsageReport) -> [(String, Int)] {
