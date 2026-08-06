@@ -856,10 +856,46 @@ private final class MenuBarController: NSObject {
         if let snapshot {
             let working = snapshot.sessions.filter { $0.state == .working }.count
             let paused = snapshot.sessions.filter { $0.state == .paused }.count
+
+            if let dailyReport {
+                let totals = dailyReport.totals
+                let report = NSMenuItem(
+                    title: "Сегодня: \(formatDuration(totals.neuralWorkSeconds)) · MCP \(totals.mcpCalls) · Tools \(totals.toolCalls) · Skills \(totals.skillReads) · Код +\(totals.codeLinesAdded)",
+                    action: nil, keyEquivalent: ""
+                )
+                report.isEnabled = false
+                menu.addItem(report)
+            }
+
+            for window in snapshot.windows {
+                let reset = window.resetsAt.map { " · сброс \(Self.timeFormatter.string(from: $0))" } ?? ""
+                let trend = rateTrend(for: window)
+                let forecast = exhaustionForecast(for: window)
+                let item = NSMenuItem(title: "\(window.label): осталось \(window.remainingPercent)%\(trend)\(forecast)\(reset)", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
+            }
+
+            if let dailyReport {
+                let totals = dailyReport.totals
+                let arcTotals = NSMenuItem(
+                    title: "ARC AI-код: +\(totals.arcMeaningfulCodeLinesAdded ?? 0) содержательных строк · репозиториев \(totals.arcRepositories ?? 0)",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                arcTotals.isEnabled = false
+                menu.addItem(arcTotals)
+                for (repository, lines) in arcRepositorySummary(for: dailyReport) {
+                    let item = NSMenuItem(title: "  \(repository): +\(lines) строк Codex", action: nil, keyEquivalent: "")
+                    item.isEnabled = false
+                    menu.addItem(item)
+                }
+            }
+
+            menu.addItem(.separator())
             let sessions = NSMenuItem(title: "Активных сессий: \(snapshot.activeSessions) · с новыми событиями: \(working) · без новых событий: \(paused)", action: nil, keyEquivalent: "")
             sessions.isEnabled = false
             menu.addItem(sessions)
-
             for session in snapshot.sessions {
                 let item = NSMenuItem(
                     title: "  \(session.id.prefix(8)) · \(session.state.label) · задач \(session.taskCount) · \(Self.timeFormatter.string(from: session.lastActivity))",
@@ -878,29 +914,6 @@ private final class MenuBarController: NSObject {
                 mcp.isEnabled = false
                 menu.addItem(mcp)
             }
-
-            if let dailyReport {
-                let totals = dailyReport.totals
-                let report = NSMenuItem(
-                    title: "Сегодня: \(formatDuration(totals.neuralWorkSeconds)) · MCP \(totals.mcpCalls) · Tools \(totals.toolCalls) · Skills \(totals.skillReads) · Код +\(totals.codeLinesAdded) · ARC AI-код +\(totals.arcMeaningfulCodeLinesAdded ?? 0)",
-                    action: nil, keyEquivalent: ""
-                )
-                report.isEnabled = false
-                menu.addItem(report)
-            }
-
-            for window in snapshot.windows {
-                let reset = window.resetsAt.map { " · сброс \(Self.timeFormatter.string(from: $0))" } ?? ""
-                let trend = rateTrend(for: window)
-                let forecast = exhaustionForecast(for: window)
-                let item = NSMenuItem(title: "\(window.label): осталось \(window.remainingPercent)%\(trend)\(forecast)\(reset)", action: nil, keyEquivalent: "")
-                item.isEnabled = false
-                menu.addItem(item)
-            }
-
-            let updated = NSMenuItem(title: "Обновлено \(Self.timeFormatter.string(from: snapshot.updatedAt)) · каждые \(Int(settings.refreshInterval)) сек", action: nil, keyEquivalent: "")
-            updated.isEnabled = false
-            menu.addItem(updated)
         } else {
             let item = NSMenuItem(title: "Лимит ещё не найден", action: nil, keyEquivalent: "")
             item.isEnabled = false
@@ -948,6 +961,16 @@ private final class MenuBarController: NSObject {
         let hours = seconds / 3_600
         let minutes = (seconds % 3_600) / 60
         return hours > 0 ? "\(hours)ч \(minutes)м" : "\(minutes)м"
+    }
+
+    private func arcRepositorySummary(for report: DailyUsageReport) -> [(String, Int)] {
+        Dictionary(grouping: report.sessions.compactMap { session -> (String, Int)? in
+            guard let repository = session.arcRepository else { return nil }
+            return (repository, session.arcMeaningfulCodeLinesAdded ?? 0)
+        }, by: { $0.0 })
+        .map { repository, entries in (repository, entries.reduce(0) { $0 + $1.1 }) }
+        .filter { $0.1 > 0 }
+        .sorted { $0.0 < $1.0 }
     }
 
     private func rateTrend(for window: RateWindow) -> String {
