@@ -380,7 +380,7 @@ private final class DailyUsageReporter {
                 }
             case "patch_apply_end":
                 let changes = payload["changes"] as? [String: Any] ?? [:]
-                for (path, change) in changes where Self.isCodeFile(path) {
+                for (path, change) in changes where Self.isTrackableWorkFile(path) {
                     guard let diff = (change as? [String: Any])?["unified_diff"] as? String else { continue }
                     for diffLine in diff.split(separator: "\n", omittingEmptySubsequences: false) {
                         if diffLine.hasPrefix("+") && !diffLine.hasPrefix("+++") { codeLinesAdded += 1 }
@@ -413,10 +413,18 @@ private final class DailyUsageReporter {
         return header + rows.joined(separator: "\n") + "\n"
     }
 
-    private static func isCodeFile(_ path: String) -> Bool {
-        ["c", "cc", "cpp", "cs", "go", "java", "js", "jsx", "kt", "kts", "m", "mm", "php", "py", "rb", "rs", "swift", "ts", "tsx"].contains {
-            path.lowercased().hasSuffix(".\($0)")
-        }
+    /// Counts implementation and configuration changes made by Codex. Configuration
+    /// is deliberately included: in Arcadia, meaningful AI-authored work often
+    /// lives in API specs, CI and service YAML rather than a source file.
+    private static func isTrackableWorkFile(_ path: String) -> Bool {
+        let fileExtension = URL(fileURLWithPath: path).pathExtension.lowercased()
+        let extensions: Set<String> = [
+            "c", "cc", "cpp", "cs", "css", "go", "graphql", "h", "hpp", "html",
+            "java", "js", "jsx", "json", "kt", "kts", "m", "mm", "php", "proto",
+            "py", "rb", "rs", "scss", "sh", "sql", "swift", "toml", "ts", "tsx",
+            "vue", "xml", "yaml", "yml", "zsh"
+        ]
+        return extensions.contains(fileExtension)
     }
 
     /// Arcadia mounts expose `.arcadia.root` at their true root. Walking upwards
