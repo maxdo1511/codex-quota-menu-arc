@@ -624,13 +624,39 @@ private final class SettingsWindowController: NSWindowController {
     }
 }
 
-private final class RateHistoryGraphView: NSView {
+private class DashboardChartView: NSView {
+    override var isFlipped: Bool { true }
+
+    func drawSurface() -> NSRect {
+        let surface = bounds.insetBy(dx: 0, dy: 0)
+        NSColor.controlBackgroundColor.setFill()
+        NSBezierPath(roundedRect: surface, xRadius: 12, yRadius: 12).fill()
+        return surface.insetBy(dx: 18, dy: 16)
+    }
+
+    func drawEmptyState(_ text: String) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let size = text.size(withAttributes: attributes)
+        text.draw(at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2), withAttributes: attributes)
+    }
+}
+
+private final class RateHistoryGraphView: DashboardChartView {
     var samples: [RateSample] = [] { didSet { needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        let rect = bounds.insetBy(dx: 14, dy: 22)
-        NSColor.quaternaryLabelColor.setStroke()
+        let rect = drawSurface()
+        let keys = Array(Set(samples.flatMap { $0.remainingByWindow.keys })).sorted()
+        guard !keys.isEmpty, samples.count > 1 else {
+            drawEmptyState("История лимита начнёт строиться после первых измерений")
+            return
+        }
+
+        NSColor.separatorColor.setStroke()
         let grid = NSBezierPath()
         for level in [0.0, 0.5, 1.0] {
             let y = rect.minY + rect.height * level
@@ -640,46 +666,91 @@ private final class RateHistoryGraphView: NSView {
         grid.lineWidth = 1
         grid.stroke()
 
-        let keys = Array(Set(samples.flatMap { $0.remainingByWindow.keys })).sorted()
+        let colors = [NSColor.systemBlue, NSColor.systemTeal, NSColor.systemIndigo]
         for (index, key) in keys.enumerated() {
             let points = samples.enumerated().compactMap { offset, sample -> NSPoint? in
                 guard let remaining = sample.remainingByWindow[key] else { return nil }
-                let x = samples.count == 1 ? rect.midX : rect.minX + rect.width * CGFloat(offset) / CGFloat(samples.count - 1)
-                return NSPoint(x: x, y: rect.minY + rect.height * CGFloat(remaining) / 100)
+                let x = rect.minX + rect.width * CGFloat(offset) / CGFloat(samples.count - 1)
+                let y = rect.maxY - rect.height * CGFloat(remaining) / 100
+                return NSPoint(x: x, y: y)
             }
             guard let first = points.first else { continue }
             let line = NSBezierPath()
             line.move(to: first)
             for point in points.dropFirst() { line.line(to: point) }
-            [NSColor.systemBlue, NSColor.systemGreen, NSColor.systemOrange][index % 3].setStroke()
-            line.lineWidth = 2
+            colors[index % colors.count].setStroke()
+            line.lineWidth = 2.5
+            line.lineCapStyle = .round
+            line.lineJoinStyle = .round
             line.stroke()
         }
-
-        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor]
-        "0%                         Остаток лимита                         100%".draw(at: NSPoint(x: 14, y: 4), withAttributes: attributes)
     }
 }
 
-private final class DailyHistoryGraphView: NSView {
+private final class DailyHistoryGraphView: DashboardChartView {
     var reports: [DailyUsageReport] = [] { didSet { needsDisplay = true } }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard !reports.isEmpty else { return }
-        let rect = bounds.insetBy(dx: 14, dy: 22)
-        let maxSeconds = max(1, reports.map(\.totals.neuralWorkSeconds).max() ?? 1)
+        let rect = drawSurface()
+        let maxSeconds = reports.map(\.totals.neuralWorkSeconds).max() ?? 0
+        guard !reports.isEmpty, maxSeconds > 0 else {
+            drawEmptyState("В этом периоде ещё нет работы Codex")
+            return
+        }
+
         let slotWidth = rect.width / CGFloat(reports.count)
-        let barWidth = slotWidth * 0.6
+        let barWidth = min(52, slotWidth * 0.58)
         for (index, report) in reports.enumerated() {
-            let height = rect.height * CGFloat(report.totals.neuralWorkSeconds) / CGFloat(maxSeconds)
-            let bar = NSRect(x: rect.minX + CGFloat(index) * slotWidth + (slotWidth - barWidth) / 2, y: rect.minY, width: barWidth, height: height)
+            let height = max(3, rect.height * CGFloat(report.totals.neuralWorkSeconds) / CGFloat(maxSeconds))
+            let x = rect.minX + CGFloat(index) * slotWidth + (slotWidth - barWidth) / 2
+            let bar = NSRect(x: x, y: rect.maxY - height, width: barWidth, height: height)
             NSColor.systemPurple.setFill()
-            NSBezierPath(roundedRect: bar, xRadius: 3, yRadius: 3).fill()
-            let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.secondaryLabelColor]
-            String(report.day.suffix(5)).draw(at: NSPoint(x: bar.minX, y: 4), withAttributes: attributes)
+            NSBezierPath(roundedRect: bar, xRadius: 5, yRadius: 5).fill()
+
+            let label = String(report.day.suffix(5))
+            let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor]
+            let size = label.size(withAttributes: attributes)
+            label.draw(at: NSPoint(x: x + (barWidth - size.width) / 2, y: rect.maxY + 5), withAttributes: attributes)
         }
     }
+}
+
+private final class MetricCardView: NSView {
+    private let titleLabel: NSTextField
+    private let valueLabel = NSTextField(labelWithString: "—")
+
+    init(title: String, tint: NSColor) {
+        titleLabel = NSTextField(labelWithString: title)
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.backgroundColor = tint.withAlphaComponent(0.10).cgColor
+        layer?.borderColor = tint.withAlphaComponent(0.18).cgColor
+        layer?.borderWidth = 1
+
+        titleLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        titleLabel.textColor = .secondaryLabelColor
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 22, weight: .semibold)
+        valueLabel.textColor = .labelColor
+        let stack = NSStackView(views: [titleLabel, valueLabel])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 5
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 150, height: 76) }
+
+    func setValue(_ value: String) { valueLabel.stringValue = value }
 }
 
 @MainActor
@@ -688,24 +759,35 @@ private final class HistoryWindowController: NSWindowController {
     private let reporter: DailyUsageReporter
     private let rateGraph = RateHistoryGraphView()
     private let dailyGraph = DailyHistoryGraphView()
-    private let summaryLabel = NSTextField(wrappingLabelWithString: "")
+    private let workCard = MetricCardView(title: "ВРЕМЯ РАБОТЫ", tint: .systemBlue)
+    private let taskCard = MetricCardView(title: "ЗАДАЧИ", tint: .systemIndigo)
+    private let arcCard = MetricCardView(title: "ARC AI‑КОД", tint: .systemPurple)
+    private let mcpCard = MetricCardView(title: "MCP ВЫЗОВЫ", tint: .systemTeal)
+    private let comparisonLabel = NSTextField(labelWithString: "")
     private let daysLabel = NSTextField(wrappingLabelWithString: "")
 
     init(rateHistory: RateHistoryStore, reporter: DailyUsageReporter) {
         self.rateHistory = rateHistory
         self.reporter = reporter
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 690),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false
         )
-        window.title = "Codex Quota — История"
-        window.minSize = NSSize(width: 520, height: 440)
+        window.title = "Codex Quota — Статистика"
+        window.minSize = NSSize(width: 680, height: 590)
+        window.isReleasedWhenClosed = false
         super.init(window: window)
         configureWindow()
     }
 
     required init?(coder: NSCoder) { nil }
+
+    func showCentered() {
+        window?.center()
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+    }
 
     func reload(currentReport: DailyUsageReport) {
         rateGraph.samples = rateHistory.samples()
@@ -713,48 +795,100 @@ private final class HistoryWindowController: NSWindowController {
         reports.append(currentReport)
         reports.sort { $0.day < $1.day }
         dailyGraph.reports = reports
-        let yesterday = reports.last(where: { $0.day != currentReport.day })
-        let comparison: String
-        if let yesterday {
-            let workDelta = currentReport.totals.neuralWorkSeconds - yesterday.totals.neuralWorkSeconds
-            let mcpDelta = currentReport.totals.mcpCalls - yesterday.totals.mcpCalls
-            comparison = "К вчера: \(workDelta >= 0 ? "+" : "")\(Self.duration(workDelta)) работы · MCP \(mcpDelta >= 0 ? "+" : "")\(mcpDelta)"
+
+        let totals = currentReport.totals
+        workCard.setValue(Self.duration(totals.neuralWorkSeconds))
+        taskCard.setValue("\(totals.tasks)")
+        arcCard.setValue("+\(totals.arcMeaningfulCodeLinesAdded ?? 0)")
+        mcpCard.setValue("\(totals.mcpCalls)")
+
+        if let yesterday = reports.last(where: { $0.day != currentReport.day }) {
+            if totals.neuralWorkSeconds == 0 {
+                comparisonLabel.stringValue = "Сегодня пока нет активности · вчера: \(Self.duration(yesterday.totals.neuralWorkSeconds))"
+            } else {
+                let delta = totals.neuralWorkSeconds - yesterday.totals.neuralWorkSeconds
+                comparisonLabel.stringValue = "К вчера: \(delta >= 0 ? "+" : "")\(Self.duration(delta)) работы · ARC AI‑код +\(totals.arcMeaningfulCodeLinesAdded ?? 0)"
+            }
         } else {
-            comparison = "Сравнение со вчера появится после первого сохранённого отчёта."
+            comparisonLabel.stringValue = "Сравнение появится после первого сохранённого дня"
         }
-        summaryLabel.stringValue = "Сегодня: \(Self.duration(currentReport.totals.neuralWorkSeconds)) · задач \(currentReport.totals.tasks) · MCP \(currentReport.totals.mcpCalls) · Tools \(currentReport.totals.toolCalls) · Skills \(currentReport.totals.skillReads) · код +\(currentReport.totals.codeLinesAdded) · ARC AI-код +\(currentReport.totals.arcMeaningfulCodeLinesAdded ?? 0) (репо \(currentReport.totals.arcRepositories ?? 0)). \(comparison)"
-        daysLabel.stringValue = reports.map { "\($0.day): \(Self.duration($0.totals.neuralWorkSeconds)), задач \($0.totals.tasks), MCP \($0.totals.mcpCalls)" }.joined(separator: "\n")
+
+        daysLabel.stringValue = reports.suffix(4).map {
+            "\($0.day)    \(Self.duration($0.totals.neuralWorkSeconds))    задач \($0.totals.tasks)    ARC +\($0.totals.arcMeaningfulCodeLinesAdded ?? 0)"
+        }.joined(separator: "\n")
     }
 
     private func configureWindow() {
-        summaryLabel.font = .systemFont(ofSize: 13)
-        summaryLabel.maximumNumberOfLines = 3
-        let rateTitle = NSTextField(labelWithString: "Расход лимита — последние 7 дней")
-        rateTitle.font = .systemFont(ofSize: 14, weight: .semibold)
-        let dayTitle = NSTextField(labelWithString: "Работа по дням")
-        dayTitle.font = .systemFont(ofSize: 14, weight: .semibold)
-        rateGraph.translatesAutoresizingMaskIntoConstraints = false
-        dailyGraph.translatesAutoresizingMaskIntoConstraints = false
-        rateGraph.heightAnchor.constraint(equalToConstant: 160).isActive = true
-        dailyGraph.heightAnchor.constraint(equalToConstant: 120).isActive = true
-        let stack = NSStackView(views: [summaryLabel, rateTitle, rateGraph, dayTitle, dailyGraph, daysLabel])
+        let content = NSView()
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        window?.contentView = content
+
+        let title = NSTextField(labelWithString: "Статистика Codex")
+        title.font = .systemFont(ofSize: 24, weight: .bold)
+        let subtitle = NSTextField(labelWithString: "Работа, лимиты и вклад Codex в Arcadia")
+        subtitle.font = .systemFont(ofSize: 13)
+        subtitle.textColor = .secondaryLabelColor
+        comparisonLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        comparisonLabel.textColor = .secondaryLabelColor
+
+        let header = NSStackView(views: [title, subtitle, comparisonLabel])
+        header.orientation = .vertical
+        header.alignment = .leading
+        header.spacing = 4
+
+        let metrics = NSStackView(views: [workCard, taskCard, arcCard, mcpCard])
+        metrics.orientation = .horizontal
+        metrics.alignment = .centerY
+        metrics.distribution = .fillEqually
+        metrics.spacing = 10
+
+        let rateSection = section(title: "Лимит", subtitle: "Остаток по текущим окнам", chart: rateGraph, height: 150)
+        let daySection = section(title: "Работа по дням", subtitle: "Длительность задач Codex", chart: dailyGraph, height: 118)
+
+        daysLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        daysLabel.textColor = .secondaryLabelColor
+        daysLabel.maximumNumberOfLines = 4
+        let activityTitle = NSTextField(labelWithString: "Последние дни")
+        activityTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        let activity = NSStackView(views: [activityTitle, daysLabel])
+        activity.orientation = .vertical
+        activity.alignment = .leading
+        activity.spacing = 6
+
+        let stack = NSStackView(views: [header, metrics, rateSection, daySection, activity])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.spacing = 18
         stack.translatesAutoresizingMaskIntoConstraints = false
-        let scroll = NSScrollView()
-        scroll.documentView = stack
-        scroll.hasVerticalScroller = true
-        window?.contentView = scroll
+        content.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            rateGraph.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
-            dailyGraph.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40)
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -24),
+            metrics.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
+    }
+
+    private func section(title: String, subtitle: String, chart: NSView, height: CGFloat) -> NSStackView {
+        let heading = NSTextField(labelWithString: title)
+        heading.font = .systemFont(ofSize: 15, weight: .semibold)
+        let detail = NSTextField(labelWithString: subtitle)
+        detail.font = .systemFont(ofSize: 11)
+        detail.textColor = .secondaryLabelColor
+        let labelStack = NSStackView(views: [heading, detail])
+        labelStack.orientation = .vertical
+        labelStack.alignment = .leading
+        labelStack.spacing = 2
+        chart.translatesAutoresizingMaskIntoConstraints = false
+        chart.heightAnchor.constraint(equalToConstant: height).isActive = true
+        let stack = NSStackView(views: [labelStack, chart])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        chart.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        return stack
     }
 
     private static func duration(_ seconds: Int) -> String {
@@ -834,8 +968,7 @@ private final class MenuBarController: NSObject {
             historyWindow = HistoryWindowController(rateHistory: rateHistory, reporter: reporter)
         }
         historyWindow?.reload(currentReport: dailyReport)
-        historyWindow?.showWindow(nil)
-        historyWindow?.window?.makeKeyAndOrderFront(nil)
+        historyWindow?.showCentered()
         NSApp.activate(ignoringOtherApps: true)
     }
 
