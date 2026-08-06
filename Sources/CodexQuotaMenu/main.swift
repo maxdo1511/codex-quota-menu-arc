@@ -88,6 +88,13 @@ private struct DailyUsageReport: Codable {
     let sessions: [SessionUsage]
 }
 
+private struct MonthlyUsageArchive: Codable {
+    let month: String
+    let archivedAt: Date
+    let days: Int
+    let totals: UsageTotals
+}
+
 private struct RateSample: Codable {
     let recordedAt: Date
     let remainingByWindow: [Int: Int]
@@ -340,6 +347,75 @@ private final class DailyUsageReporter {
         return dayDirectory
     }
 
+    /// Compresses only this app's own completed daily reports. The original
+    /// folders are removed only after a non-empty ZIP has been created.
+    @discardableResult
+    func archiveCompletedMonths(olderThan retentionDays: Int, now: Date = .now) -> [String] {
+        guard retentionDays > 0,
+              let cutoff = Calendar.current.date(byAdding: .day, value: -retentionDays, to: now),
+              let directories = try? fileManager.contentsOfDirectory(
+                at: reportsDirectory,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+              )
+        else { return [] }
+
+        let datedDirectories = directories.compactMap { directory -> (url: URL, date: Date, month: String)? in
+            guard (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+                  let date = Self.reportDate(from: directory.lastPathComponent)
+            else { return nil }
+            return (directory, date, Self.monthString(for: date))
+        }
+        let currentMonth = Self.monthString(for: now)
+        let groups = Dictionary(grouping: datedDirectories, by: \.month)
+        let archivesDirectory = reportsDirectory.appendingPathComponent("Archives", isDirectory: true)
+        var archivedMonths: [String] = []
+
+        for (month, entries) in groups.sorted(by: { $0.key < $1.key }) {
+            guard month != currentMonth,
+                  let latestReportDate = entries.map(\.date).max(),
+                  latestReportDate < cutoff
+            else { continue }
+
+            let archiveURL = archivesDirectory.appendingPathComponent("CodexQuotaMenu-\(month).zip")
+            guard !fileManager.fileExists(atPath: archiveURL.path) else { continue }
+
+            do {
+                try fileManager.createDirectory(at: archivesDirectory, withIntermediateDirectories: true)
+                let stagingDirectory = reportsDirectory.appendingPathComponent(".archive-\(month)-\(UUID().uuidString)", isDirectory: true)
+                try fileManager.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+                defer { try? fileManager.removeItem(at: stagingDirectory) }
+
+                let reports = try entries.sorted { $0.date < $1.date }.map { entry -> DailyUsageReport in
+                    guard let report = loadSavedReport(from: entry.url) else {
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    try fileManager.copyItem(at: entry.url, to: stagingDirectory.appendingPathComponent(entry.url.lastPathComponent, isDirectory: true))
+                    return report
+                }
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                let summary = MonthlyUsageArchive(
+                    month: month,
+                    archivedAt: now,
+                    days: reports.count,
+                    totals: Self.monthlyTotals(for: reports)
+                )
+                try encoder.encode(summary).write(to: stagingDirectory.appendingPathComponent("monthly-summary.json"), options: .atomic)
+                try zip(stagingDirectory, to: archiveURL)
+                let fileSize = (try? archiveURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                guard fileSize > 0 else { continue }
+                try entries.forEach { try fileManager.removeItem(at: $0.url) }
+                archivedMonths.append(month)
+            } catch {
+                // Keep the original daily reports when an archive cannot be made.
+                continue
+            }
+        }
+        return archivedMonths
+    }
+
     func currentDayReport() -> DailyUsageReport {
         let sessions = todaySessionFiles().compactMap(sessionUsage(in:)).sorted { $0.id < $1.id }
         let totals = UsageTotals(
@@ -379,6 +455,47 @@ private final class DailyUsageReporter {
               let sessions = try? decoder.decode([SessionUsage].self, from: sessionsData)
         else { return nil }
         return DailyUsageReport(day: directory.lastPathComponent, generatedAt: .distantPast, totals: totals, sessions: sessions)
+    }
+
+    private static func monthlyTotals(for reports: [DailyUsageReport]) -> UsageTotals {
+        let allSessions = reports.flatMap(\.sessions)
+        return UsageTotals(
+            sessions: allSessions.count,
+            tasks: reports.reduce(0) { $0 + $1.totals.tasks },
+            neuralWorkSeconds: reports.reduce(0) { $0 + $1.totals.neuralWorkSeconds },
+            mcpCalls: reports.reduce(0) { $0 + $1.totals.mcpCalls },
+            toolCalls: reports.reduce(0) { $0 + $1.totals.toolCalls },
+            skillReads: reports.reduce(0) { $0 + $1.totals.skillReads },
+            codeLinesAdded: reports.reduce(0) { $0 + $1.totals.codeLinesAdded },
+            codeLinesRemoved: reports.reduce(0) { $0 + $1.totals.codeLinesRemoved },
+            arcRepositories: Set(allSessions.compactMap(\.arcRepository)).count,
+            arcMeaningfulCodeLinesAdded: reports.reduce(0) { $0 + ($1.totals.arcMeaningfulCodeLinesAdded ?? 0) }
+        )
+    }
+
+    private static func reportDate(from directoryName: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.date(from: directoryName)
+    }
+
+    private static func monthString(for date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM"
+        return formatter.string(from: date)
+    }
+
+    /// `ditto` is bundled with macOS, so creating an archive does not add a
+    /// runtime dependency for people who download the app from a release.
+    private func zip(_ source: URL, to destination: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", source.path, destination.path]
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw CocoaError(.fileWriteUnknown) }
     }
 
     private func todaySessionFiles() -> [URL] {
@@ -588,18 +705,23 @@ private final class AppSettings {
         static let showMCPs = "showRecentMCPs"
         static let exportDailyReports = "exportDailyReports"
         static let refreshInterval = "refreshInterval"
+        static let archiveReportsAfterDays = "archiveReportsAfterDays"
     }
 
     private let defaults = UserDefaults.standard
     var showRecentMCPs: Bool { didSet { defaults.set(showRecentMCPs, forKey: Key.showMCPs) } }
     var exportDailyReports: Bool { didSet { defaults.set(exportDailyReports, forKey: Key.exportDailyReports) } }
     var refreshInterval: TimeInterval { didSet { defaults.set(refreshInterval, forKey: Key.refreshInterval) } }
+    /// Zero disables archiving. Non-zero values archive closed months after the retention period.
+    var archiveReportsAfterDays: Int { didSet { defaults.set(archiveReportsAfterDays, forKey: Key.archiveReportsAfterDays) } }
 
     init() {
         showRecentMCPs = defaults.object(forKey: Key.showMCPs) as? Bool ?? false
         exportDailyReports = defaults.object(forKey: Key.exportDailyReports) as? Bool ?? true
         let storedInterval = defaults.double(forKey: Key.refreshInterval)
         refreshInterval = [1.0, 5.0, 15.0, 30.0].contains(storedInterval) ? storedInterval : 5
+        let storedArchivePeriod = defaults.object(forKey: Key.archiveReportsAfterDays) as? Int ?? 30
+        archiveReportsAfterDays = [0, 30, 90, 180].contains(storedArchivePeriod) ? storedArchivePeriod : 30
     }
 
     var reportsDirectory: URL {
@@ -624,12 +746,13 @@ private final class SettingsWindowController: NSWindowController {
     private let exportReportsCheckbox = NSButton(checkboxWithTitle: "Сохранять ежедневные отчёты", target: nil, action: nil)
     private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Запускать при входе в macOS", target: nil, action: nil)
     private let refreshIntervalPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let archiveReportsPopup = NSPopUpButton(frame: .zero, pullsDown: false)
 
     init(settings: AppSettings, didChange: @escaping () -> Void) {
         self.settings = settings
         self.didChange = didChange
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 440, height: 290),
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 330),
             styleMask: [.titled, .closable], backing: .buffered, defer: false
         )
         window.title = "Codex Quota — Настройки"
@@ -655,15 +778,23 @@ private final class SettingsWindowController: NSWindowController {
         if settings.refreshInterval == 1 { refreshIntervalPopup.selectItem(withTitle: "1 секунда") }
         refreshIntervalPopup.target = self
         refreshIntervalPopup.action = #selector(saveSettings)
+        archiveReportsPopup.addItems(withTitles: ["Не архивировать", "30 дней", "90 дней", "180 дней"])
+        archiveReportsPopup.selectItem(withTitle: settings.archiveReportsAfterDays == 0 ? "Не архивировать" : "\(settings.archiveReportsAfterDays) дней")
+        archiveReportsPopup.target = self
+        archiveReportsPopup.action = #selector(saveSettings)
 
-        let description = NSTextField(wrappingLabelWithString: "Отчёты хранятся локально в Documents/Codex Quota Reports.")
+        let description = NSTextField(wrappingLabelWithString: "Отчёты хранятся локально в Documents/Codex Quota Reports. Архивы месяцев сохраняются в подпапке Archives.")
         description.textColor = .secondaryLabelColor
         let openReports = NSButton(title: "Открыть папку отчётов", target: self, action: #selector(openReportsDirectory))
         let intervalRow = NSStackView(views: [NSTextField(labelWithString: "Обновлять:"), refreshIntervalPopup])
         intervalRow.orientation = .horizontal
         intervalRow.alignment = .centerY
         intervalRow.spacing = 8
-        let stack = NSStackView(views: [showMCPsCheckbox, exportReportsCheckbox, launchAtLoginCheckbox, intervalRow, description, openReports])
+        let archiveRow = NSStackView(views: [NSTextField(labelWithString: "Архивировать месяцы через:"), archiveReportsPopup])
+        archiveRow.orientation = .horizontal
+        archiveRow.alignment = .centerY
+        archiveRow.spacing = 8
+        let stack = NSStackView(views: [showMCPsCheckbox, exportReportsCheckbox, launchAtLoginCheckbox, intervalRow, archiveRow, description, openReports])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
@@ -675,6 +806,7 @@ private final class SettingsWindowController: NSWindowController {
         settings.showRecentMCPs = showMCPsCheckbox.state == .on
         settings.exportDailyReports = exportReportsCheckbox.state == .on
         settings.refreshInterval = Double(refreshIntervalPopup.selectedItem?.title.split(separator: " ").first ?? "5") ?? 5
+        settings.archiveReportsAfterDays = Int(archiveReportsPopup.selectedItem?.title.split(separator: " ").first ?? "0") ?? 0
         didChange()
     }
 
@@ -982,6 +1114,7 @@ private final class MenuBarController: NSObject {
     private var dailyReport: DailyUsageReport?
     private var lastReportUpdate = Date.distantPast
     private var lastRateHistoryUpdate = Date.distantPast
+    private var lastArchiveRunDay: String?
     private var settingsWindow: SettingsWindowController?
     private var historyWindow: HistoryWindowController?
     private var rateSamples: [RateSample] = []
@@ -1032,6 +1165,7 @@ private final class MenuBarController: NSObject {
         if settingsWindow == nil {
             settingsWindow = SettingsWindowController(settings: settings, didChange: { [weak self] in
                 self?.lastReportUpdate = .distantPast
+                self?.lastArchiveRunDay = nil
                 self?.scheduleRefreshTimer()
                 self?.refresh()
             })
@@ -1163,7 +1297,10 @@ private final class MenuBarController: NSObject {
         let report = reporter.currentDayReport()
         dailyReport = report
         lastReportUpdate = .now
-        _ = try? reporter.write(report)
+        if (try? reporter.write(report)) != nil, lastArchiveRunDay != report.day {
+            _ = reporter.archiveCompletedMonths(olderThan: settings.archiveReportsAfterDays)
+            lastArchiveRunDay = report.day
+        }
         return true
     }
 
