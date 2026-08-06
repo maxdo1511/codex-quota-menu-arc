@@ -63,6 +63,9 @@ private struct SessionUsage: Codable, Identifiable {
     let codeLinesAdded: Int
     let codeLinesRemoved: Int
     let mcpByName: [String: Int]
+    /// Internal ARC attribution. Optional to preserve compatibility with old reports.
+    let arcRepository: String?
+    let arcMeaningfulCodeLinesAdded: Int?
 }
 
 private struct UsageTotals: Codable {
@@ -74,6 +77,8 @@ private struct UsageTotals: Codable {
     let skillReads: Int
     let codeLinesAdded: Int
     let codeLinesRemoved: Int
+    let arcRepositories: Int?
+    let arcMeaningfulCodeLinesAdded: Int?
 }
 
 private struct DailyUsageReport: Codable {
@@ -283,7 +288,9 @@ private final class DailyUsageReporter {
             toolCalls: sessions.reduce(0) { $0 + $1.toolCalls },
             skillReads: sessions.reduce(0) { $0 + $1.skillReads },
             codeLinesAdded: sessions.reduce(0) { $0 + $1.codeLinesAdded },
-            codeLinesRemoved: sessions.reduce(0) { $0 + $1.codeLinesRemoved }
+            codeLinesRemoved: sessions.reduce(0) { $0 + $1.codeLinesRemoved },
+            arcRepositories: Set(sessions.compactMap(\.arcRepository)).count,
+            arcMeaningfulCodeLinesAdded: sessions.reduce(0) { $0 + ($1.arcMeaningfulCodeLinesAdded ?? 0) }
         )
         return DailyUsageReport(day: Self.dayString(for: .now), generatedAt: .now, totals: totals, sessions: sessions)
     }
@@ -338,12 +345,18 @@ private final class DailyUsageReporter {
         var codeLinesAdded = 0
         var codeLinesRemoved = 0
         var mcpByName: [String: Int] = [:]
+        var arcRepository: String?
+        var arcMeaningfulCodeLinesAdded = 0
 
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             guard let data = line.data(using: .utf8),
                   let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let payload = event["payload"] as? [String: Any], let type = payload["type"] as? String
+                  let payload = event["payload"] as? [String: Any]
             else { continue }
+            if event["type"] as? String == "session_meta", let cwd = payload["cwd"] as? String {
+                arcRepository = Self.arcRepositoryName(for: cwd)
+            }
+            guard let type = payload["type"] as? String else { continue }
             let timestamp = (event["timestamp"] as? String).flatMap(Self.isoDate)
             switch type {
             case "task_started":
@@ -372,6 +385,9 @@ private final class DailyUsageReporter {
                     for diffLine in diff.split(separator: "\n", omittingEmptySubsequences: false) {
                         if diffLine.hasPrefix("+") && !diffLine.hasPrefix("+++") { codeLinesAdded += 1 }
                         if diffLine.hasPrefix("-") && !diffLine.hasPrefix("---") { codeLinesRemoved += 1 }
+                        if arcRepository != nil, Self.isMeaningfulAddedCodeLine(diffLine) {
+                            arcMeaningfulCodeLinesAdded += 1
+                        }
                     }
                 }
             default: break
@@ -383,14 +399,16 @@ private final class DailyUsageReporter {
             id: id, startedAt: startedAt, completedAt: completedAt, taskCount: taskCount,
             neuralWorkSeconds: neuralWorkSeconds, mcpCalls: mcpCalls, toolCalls: toolCalls,
             skillReads: skillReads, codeLinesAdded: codeLinesAdded, codeLinesRemoved: codeLinesRemoved,
-            mcpByName: mcpByName
+            mcpByName: mcpByName,
+            arcRepository: arcRepository,
+            arcMeaningfulCodeLinesAdded: arcRepository == nil ? nil : arcMeaningfulCodeLinesAdded
         )
     }
 
     private func csv(for report: DailyUsageReport) -> String {
-        let header = "session_id,tasks,neural_work_seconds,mcp_calls,tool_calls,skill_reads,code_lines_added,code_lines_removed\n"
+        let header = "session_id,tasks,neural_work_seconds,mcp_calls,tool_calls,skill_reads,code_lines_added,code_lines_removed,arc_repository,arc_ai_meaningful_code_lines_added\n"
         let rows = report.sessions.map {
-            "\($0.id),\($0.taskCount),\($0.neuralWorkSeconds),\($0.mcpCalls),\($0.toolCalls),\($0.skillReads),\($0.codeLinesAdded),\($0.codeLinesRemoved)"
+            "\($0.id),\($0.taskCount),\($0.neuralWorkSeconds),\($0.mcpCalls),\($0.toolCalls),\($0.skillReads),\($0.codeLinesAdded),\($0.codeLinesRemoved),\($0.arcRepository ?? ""),\($0.arcMeaningfulCodeLinesAdded ?? 0)"
         }
         return header + rows.joined(separator: "\n") + "\n"
     }
@@ -399,6 +417,25 @@ private final class DailyUsageReporter {
         ["c", "cc", "cpp", "cs", "go", "java", "js", "jsx", "kt", "kts", "m", "mm", "php", "py", "rb", "rs", "swift", "ts", "tsx"].contains {
             path.lowercased().hasSuffix(".\($0)")
         }
+    }
+
+    /// ARC workspaces are recognised from the dedicated local root (`arc_*`).
+    /// This deliberately does not invoke Git or GitHub.
+    private static func arcRepositoryName(for workingDirectory: String) -> String? {
+        URL(fileURLWithPath: workingDirectory).pathComponents.first {
+            $0.lowercased().hasPrefix("arc_")
+        }
+    }
+
+    private static func isMeaningfulAddedCodeLine(_ diffLine: Substring) -> Bool {
+        guard diffLine.hasPrefix("+"), !diffLine.hasPrefix("+++") else { return false }
+        let line = diffLine.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty else { return false }
+        guard !line.hasPrefix("//"), !line.hasPrefix("/*"), !line.hasPrefix("*"), !line.hasPrefix("*/") else { return false }
+        if line.hasPrefix("#"), !line.hasPrefix("#include"), !line.hasPrefix("#if"), !line.hasPrefix("#define"), !line.hasPrefix("#pragma") {
+            return false
+        }
+        return !["{", "}", "};", "(", ")", ",", ";"].contains(String(line))
     }
 
     private static func threadID(from url: URL) -> String? {
@@ -677,7 +714,7 @@ private final class HistoryWindowController: NSWindowController {
         } else {
             comparison = "Сравнение со вчера появится после первого сохранённого отчёта."
         }
-        summaryLabel.stringValue = "Сегодня: \(Self.duration(currentReport.totals.neuralWorkSeconds)) · задач \(currentReport.totals.tasks) · MCP \(currentReport.totals.mcpCalls) · Tools \(currentReport.totals.toolCalls) · Skills \(currentReport.totals.skillReads) · код +\(currentReport.totals.codeLinesAdded). \(comparison)"
+        summaryLabel.stringValue = "Сегодня: \(Self.duration(currentReport.totals.neuralWorkSeconds)) · задач \(currentReport.totals.tasks) · MCP \(currentReport.totals.mcpCalls) · Tools \(currentReport.totals.toolCalls) · Skills \(currentReport.totals.skillReads) · код +\(currentReport.totals.codeLinesAdded) · ARC AI-код +\(currentReport.totals.arcMeaningfulCodeLinesAdded ?? 0) (репо \(currentReport.totals.arcRepositories ?? 0)). \(comparison)"
         daysLabel.stringValue = reports.map { "\($0.day): \(Self.duration($0.totals.neuralWorkSeconds)), задач \($0.totals.tasks), MCP \($0.totals.mcpCalls)" }.joined(separator: "\n")
     }
 
@@ -837,7 +874,7 @@ private final class MenuBarController: NSObject {
             if let dailyReport {
                 let totals = dailyReport.totals
                 let report = NSMenuItem(
-                    title: "Сегодня: \(formatDuration(totals.neuralWorkSeconds)) · MCP \(totals.mcpCalls) · Tools \(totals.toolCalls) · Skills \(totals.skillReads) · Код +\(totals.codeLinesAdded)",
+                    title: "Сегодня: \(formatDuration(totals.neuralWorkSeconds)) · MCP \(totals.mcpCalls) · Tools \(totals.toolCalls) · Skills \(totals.skillReads) · Код +\(totals.codeLinesAdded) · ARC AI-код +\(totals.arcMeaningfulCodeLinesAdded ?? 0)",
                     action: nil, keyEquivalent: ""
                 )
                 report.isEnabled = false
