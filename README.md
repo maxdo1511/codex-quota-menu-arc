@@ -44,6 +44,12 @@ CODE_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./Scripts/buil
 
 Затем notarize приложение у Apple перед публикацией релиза.
 
+## Установка без CLI
+
+В разделе [Releases](../../releases) скачай архив `CodexQuotaMenu-<версия>-macos.zip`, распакуй его и перетащи `CodexQuotaMenu.app` в `/Applications`. Swift, Homebrew и другие CLI-инструменты для этого не нужны.
+
+Первый публичный релиз подписан ad-hoc подписью. Если Gatekeeper заблокирует запуск, открой приложение через Finder с зажатой клавишей Control и выбери «Открыть». После подписи Developer ID и notarization этот шаг не понадобится.
+
 ## Ограничение
 
 Codex не предоставляет публичного локального API для квот, поэтому приложение опирается на формат журналов Desktop/CLI. Если будущая версия Codex поменяет формат `rate_limits`, строка меню покажет `Codex —`, пока парсер не будет обновлён.

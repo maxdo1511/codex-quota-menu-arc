@@ -1,4 +1,5 @@
 .build/
 dist/
+release/
 .DS_Store
 Resources/AppIcon-source.png
